@@ -95,6 +95,8 @@ static const int kH264StreamDefaultFrameRate = 30;
  - explicitWidth/explicitHeight: if both > 0, the encoder session is
    created at exactly this size (caller picks landscape/portrait to
    match the current orientation); otherwise outputScale is used.
+   Odd dimensions are rounded DOWN to even (the encoder silently
+   adjusts 405 -> 404; the configured size must be the real size).
  - bindHost: IPv4 literal to bind (e.g. the Tailscale IP), or nil to
    bind all interfaces (same posture as VNC when -b is not given).
  Returns NO if the arguments are invalid (port out of range, scale

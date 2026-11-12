@@ -20,6 +20,12 @@
  - The encoder session is created LAZILY, on the first captured frame
    that arrives while a viewer is connected. Creating it earlier would
    require guessing the source size; the first frame tells us the truth.
+   Creation costs ~0.04 s warm / ~0.44 s cold (measured by the
+   standalone smoke test) on the main thread, once per session — a
+   one-time hitch when the first viewer connects, not per frame.
+   It is kept synchronous deliberately: the alternative (async
+   creation) would drop the first ~half-second of frames instead, for
+   the same total delay, with a new race to verify.
  - encodeSampleBuffer: runs on the main thread (ScreenCapturer's
    CADisplayLink). It never blocks: if the encoder already has 2 frames
    in flight, the frame is dropped and counted.
@@ -223,6 +229,18 @@ static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sour
         TVLog(@"H264: explicit size %dx%d too small (min 16x16); configuration unchanged", explicitWidth,
               explicitHeight);
         return NO;
+    }
+    // H.264 needs even dimensions. The encoder silently adjusts odd
+    // ones (Track 3 measured 540x405 -> 540x404), which would leave
+    // our recorded size disagreeing with the real output. Round down
+    // here, once, so the configured size is always the real size.
+    if (explicitWidth > 0 && (explicitWidth & 1)) {
+        TVLog(@"H264: explicit width %d is odd; using %d", explicitWidth, explicitWidth & ~1);
+        explicitWidth &= ~1;
+    }
+    if (explicitHeight > 0 && (explicitHeight & 1)) {
+        TVLog(@"H264: explicit height %d is odd; using %d", explicitHeight, explicitHeight & ~1);
+        explicitHeight &= ~1;
     }
     _port = port;
     _bitrateBps = (bitrateBps > 0) ? bitrateBps : kH264StreamDefaultBitrateBps;
@@ -547,7 +565,14 @@ static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sour
         _encWidth = 0;
         _encHeight = 0;
         [_sessionLock unlock];
-        VTCompressionSessionCompleteFrames(old, CMTimeMake(0, 1));
+        // NOTE: no VTCompressionSessionCompleteFrames here, deliberately.
+        // With a numeric timestamp it would complete only frames with
+        // PTS <= that value (ours are large and positive, so: none);
+        // with kCMTimeInvalid it would flush everything but BLOCK until
+        // the encoder drains — a stuck encoder would hang the main
+        // thread in this path. Teardown drops pending frames by design;
+        // Invalidate disposes of them and their callbacks fire with an
+        // error (or not at all — the _inFlight clamp covers that).
         VTCompressionSessionInvalidate(old);
         CFRelease(old);
         [_sessionLock lock];
@@ -675,7 +700,9 @@ static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sour
     // handleEncodedSampleBuffer.)
     _inFlight.store(0);
     if (old) {
-        VTCompressionSessionCompleteFrames(old, CMTimeMake(0, 1));
+        // See the note in ensureSessionForPixelBuffer: no
+        // CompleteFrames here — teardown drops pending frames and must
+        // never block on the encoder.
         VTCompressionSessionInvalidate(old);
         CFRelease(old);
         TVLog(@"H264: encoder session torn down");
