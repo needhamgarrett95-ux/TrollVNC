@@ -27,6 +27,7 @@ trollvncserver_FILES += src/BulletinManager.mm
 trollvncserver_FILES += src/ClipboardManager.mm
 trollvncserver_FILES += src/ScreenCapturer.mm
 trollvncserver_FILES += src/STHIDEventGenerator.mm
+trollvncserver_FILES += src/H264Streamer.mm
 trollvncserver_FILES += src/OhMyJetsam.mm
 
 trollvncserver_CFLAGS += -fobjc-arc
@@ -82,6 +83,7 @@ trollvncserver_FRAMEWORKS += IOSurface
 trollvncserver_FRAMEWORKS += QuartzCore
 trollvncserver_FRAMEWORKS += UIKit
 trollvncserver_FRAMEWORKS += UserNotifications
+trollvncserver_FRAMEWORKS += VideoToolbox
 
 trollvncserver_PRIVATE_FRAMEWORKS += FrontBoardServices
 
