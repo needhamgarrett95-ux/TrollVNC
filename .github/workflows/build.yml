@@ -70,7 +70,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
 
     strategy:
       matrix:
@@ -106,7 +106,7 @@ jobs:
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: "16.2"
+          xcode-version: "latest"
 
       - name: Generate Managed.plist (managed build)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.is_managed == true }}
@@ -181,7 +181,7 @@ jobs:
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/release'
     needs: build
-    runs-on: macos-15
+    runs-on: macos-26
 
     steps:
       - name: Checkout repository
