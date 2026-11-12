@@ -47,6 +47,7 @@
 #import "ClipboardManager.h"
 #import "Control.h"
 #import "FBSOrientationObserver.h"
+#import "H264Streamer.h"
 #import "IOKitSPI.h"
 #import "Logging.h"
 #import "PSAssistiveTouchSettingsDetail.h"
@@ -112,6 +113,13 @@ static int gHttpPort = 0;
 static char *gHttpDirOverride = NULL;
 static char *gSslCertPath = NULL;
 static char *gSslKeyPath = NULL;
+
+// BartStream: H.264 push video alongside VNC (see H264Streamer.h).
+// VNC stays on gPort for input; video is pushed on gH264Port.
+// Defaults: enabled, port 5902, spec "0.25@500" (quarter-scale, 500 kbps).
+static BOOL gH264Enabled = YES;
+static int gH264Port = 5902;
+static NSString *gH264Spec = @"0.25@500";
 
 // Bonjour / mDNS Auto-Discovery
 static BOOL gBonjourEnabled = YES; // publish _rfb._tcp (and optional _http._tcp)
@@ -318,6 +326,11 @@ static void printUsageAndExit(const char *prog) {
     fprintf(stderr, "  -D path    Absolute path for HTTP document root\n");
     fprintf(stderr, "  -e file    Path to SSL certificate file\n");
     fprintf(stderr, "  -k file    Path to SSL private key file\n\n");
+
+    fprintf(stderr, "H.264 push video (BartStream, alongside VNC):\n");
+    fprintf(stderr, "  -y port    H.264 push-stream TCP port (0=off, default: 5902)\n");
+    fprintf(stderr, "  -z spec    H.264 spec: scale@kbps (0.25@500) or WxH@kbps (810x1080@1000)\n");
+    fprintf(stderr, "             Video is PUSHED (no RTT gate); VNC stays for input only.\n\n");
 
     fprintf(stderr, "Bonjour/mDNS:\n");
     fprintf(stderr, "  -B on|off  Advertise on local network via Bonjour (_rfb._tcp, _http._tcp) (default: on)\n\n");
@@ -553,6 +566,27 @@ static void parseDaemonOptions(void) {
         } else {
             gHttpPort = v;
         }
+    }
+
+    // BartStream H.264 push video (keys absent = defaults: enabled, 5902, "0.25@500").
+    NSNumber *h264EnabledN = [prefs objectForKey:@"H264Enabled"];
+    if ([h264EnabledN isKindOfClass:[NSNumber class]])
+        gH264Enabled = h264EnabledN.boolValue;
+    NSNumber *h264PortN = [prefs objectForKey:@"H264Port"];
+    if ([h264PortN isKindOfClass:[NSNumber class]] || [h264PortN isKindOfClass:[NSString class]]) {
+        int v = h264PortN.intValue;
+        if (v == 0) {
+            gH264Port = 0; // disabled
+        } else if (v < 0 || v > 65535 || v < 1024) {
+            TVLog(@"-daemon: invalid H264 Port=%d; using default 5902", v);
+            gH264Port = 5902;
+        } else {
+            gH264Port = v;
+        }
+    }
+    NSString *h264Spec = [prefs objectForKey:@"H264Spec"];
+    if ([h264Spec isKindOfClass:[NSString class]] && h264Spec.length > 0) {
+        gH264Spec = h264Spec;
     }
 
     // Booleans
@@ -809,6 +843,7 @@ static void parseDaemonOptions(void) {
     [cfg appendFormat:@"name='%@' ", gDesktopName];
     [cfg appendFormat:@"bindHost='%@' ", gBindHost];
     [cfg appendFormat:@"port=%d http=%d ", gPort, gHttpPort];
+    [cfg appendFormat:@"h264=%@:%d:%@ ", gH264Enabled ? @"on" : @"off", gH264Port, gH264Spec];
 
     // Reverse connection summary
     const char *revModeStr = isRepeaterEnabled() ? (gRepeaterMode == 2 ? "repeater" : "viewer") : "off";
@@ -1028,7 +1063,7 @@ static void parseCLI(int argc, const char *argv[]) {
 #pragma clang diagnostic pop
 
     int opt;
-    const char *optstr = "p:b:n:vA:c:C:s:F:W:w:NM:KU:O:o:I:i:H:D:e:k:B:T:Vh";
+    const char *optstr = "p:b:n:vA:c:C:s:F:W:w:NM:KU:O:o:I:i:H:D:e:k:B:T:Vh:y:z:";
     optind = 1;
     while ((opt = getopt(__argc2, __argv2.data(), optstr)) != -1) {
         switch (opt) {
@@ -1316,6 +1351,28 @@ static void parseCLI(int argc, const char *argv[]) {
             }
             gHttpPort = (int)hp;
             TVLog(@"CLI: HTTP port set to %d (-H)", gHttpPort);
+            break;
+        }
+        case 'y': {
+            long hp = strtol(optarg ? optarg : "5902", NULL, 10);
+            if (hp < 0 || hp > 65535) {
+                TVPrintError("Invalid H.264 port: %s (expected 0..65535)", optarg);
+                exit(EXIT_FAILURE);
+            }
+            gH264Port = (int)hp;
+            gH264Enabled = (gH264Port != 0);
+            TVLog(@"CLI: H.264 push-stream port set to %d (-y)%s", gH264Port,
+                  gH264Enabled ? "" : " (disabled)");
+            break;
+        }
+        case 'z': {
+            const char *spec = optarg ? optarg : "";
+            if (!*spec) {
+                TVPrintError("Invalid H.264 spec: empty (expected 0.25@500 or 810x1080@1000)");
+                exit(EXIT_FAILURE);
+            }
+            gH264Spec = [NSString stringWithUTF8String:spec];
+            TVLog(@"CLI: H.264 spec set to %@ (-z)", gH264Spec);
             break;
         }
         case 'D': {
@@ -3088,6 +3145,37 @@ static void tvPublishClientDisconnectedNotif(NSString *host) {
 static BOOL gIsCaptureStarted = NO;
 static BOOL gIsClipboardStarted = NO;
 
+// Capture demand: screen capture runs while ANYONE is watching — a VNC
+// client (gClientCount > 0) OR an H.264 push-stream viewer. Before
+// BartStream, capture was gated on VNC clients alone; without this,
+// the H.264 stream would die whenever the last VNC client disconnected.
+// All state transitions run on the main thread: the RFB hooks call this
+// from the libvncserver thread, and the H.264 demand handler calls it
+// from the streamer queue, so both hop here first. Serializing on main
+// removes the race where a viewer connects in the same instant the last
+// VNC client leaves and capture ends up stopped with a viewer attached.
+// (ScreenCapturer itself also hops to main internally; this keeps the
+// gIsCaptureStarted flag consistent with it.)
+static void updateCaptureDemand(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            updateCaptureDemand();
+        });
+        return;
+    }
+    BOOL wantCapture = (gClientCount > 0) || [[H264Streamer sharedStreamer] hasClients];
+    if (wantCapture && !gIsCaptureStarted && gFrameHandler) {
+        gIsCaptureStarted = YES;
+        [[ScreenCapturer sharedCapturer] startCaptureWithFrameHandler:gFrameHandler];
+        TVLog(@"Screen capture started (vncClients=%d, h264Clients=%@).", gClientCount,
+              [[H264Streamer sharedStreamer] hasClients] ? @"YES" : @"NO");
+    } else if (!wantCapture && gIsCaptureStarted) {
+        [[ScreenCapturer sharedCapturer] endCapture];
+        gIsCaptureStarted = NO;
+        TVLog(@"No clients remaining; screen capture stopped.");
+    }
+}
+
 #if !TARGET_OS_SIMULATOR
 static BOOL gRestoreAssist = NO;
 #endif
@@ -3122,11 +3210,7 @@ static void clientGoneHook(rfbClientPtr cl) {
     NSString *host = (cl && cl->host) ? [NSString stringWithUTF8String:cl->host] : @"";
     TVLog(@"Client %@ disconnected, active clients=%d", host, gClientCount);
 
-    if (gIsCaptureStarted && gClientCount == 0) {
-        [[ScreenCapturer sharedCapturer] endCapture];
-        gIsCaptureStarted = NO;
-        TVLog(@"No clients remaining; screen capture stopped.");
-    }
+    updateCaptureDemand(); // stops capture only if no VNC client AND no H.264 viewer remains
 
     if (gIsClipboardStarted && gClientCount == 0) {
         [[ClipboardManager sharedManager] stop];
@@ -3220,12 +3304,7 @@ static enum rfbNewClientAction newClientHook(rfbClientPtr cl) {
     // Notify client connected
     tvPublishClientConnectedNotif(host);
 
-    if (!gIsCaptureStarted && gClientCount > 0 && gFrameHandler) {
-        // Start capture when entering non-zero client population.
-        gIsCaptureStarted = YES;
-        [[ScreenCapturer sharedCapturer] startCaptureWithFrameHandler:gFrameHandler];
-        TVLog(@"Screen capture started (clients=%d).", gClientCount);
-    }
+    updateCaptureDemand(); // starts capture on first viewer (VNC or H.264)
 
     if (gClipboardEnabled && !gIsClipboardStarted && gClientCount > 0) {
         gIsClipboardStarted = YES;
@@ -3486,7 +3565,49 @@ static void prepareScreenCapturer(void) {
 
     gFrameHandler = ^(CMSampleBufferRef _Nonnull sampleBuffer) {
         handleFramebuffer(sampleBuffer);
+        // BartStream: the same frame feeds the H.264 push stream.
+        // ScreenCapturer supports only ONE handler, so the streamer is
+        // chained here rather than registered separately. The streamer
+        // itself drops the frame when no viewer is connected, so this
+        // costs nothing when the stream is idle.
+        if (gH264Enabled) {
+            [[H264Streamer sharedStreamer] encodeSampleBuffer:sampleBuffer];
+        }
     };
+}
+
+static void prepareH264Streamer(void) {
+    if (!gH264Enabled || gH264Port == 0) {
+        TVLog(@"H264: push stream disabled; VNC-only mode");
+        return;
+    }
+
+    H264Streamer *streamer = [H264Streamer sharedStreamer];
+    if (![streamer configureWithSpec:gH264Spec port:gH264Port bindHost:gBindHost]) {
+        TVLog(@"H264: invalid spec '%@' — push stream disabled; VNC-only mode", gH264Spec);
+        gH264Enabled = NO;
+        return;
+    }
+
+    // Capture demand from the H.264 side: keep capture running while a
+    // push-stream viewer is connected, even with no VNC client. The
+    // handler runs on the streamer's queue, so hop to main first.
+    // (The block holds no streamer reference, so there is no retain cycle.)
+    streamer.demandChangedHandler = ^(BOOL hasClients) {
+        (void)hasClients;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            updateCaptureDemand();
+        });
+    };
+
+    if (![streamer startListener]) {
+        // startListener already logged the reason. VNC keeps working;
+        // do not exit: a failed H.264 bind must not kill remote input.
+        gH264Enabled = NO;
+        TVLog(@"H264: listener failed to start — continuing VNC-only");
+        return;
+    }
+    TVLog(@"H264: push stream armed: port=%d spec=%@ (VNC stays on %d for input)", gH264Port, gH264Spec, gPort);
 }
 
 static void prepareBulletinManager(void) {
@@ -4205,6 +4326,7 @@ int main(int argc, const char *argv[]) {
         prepareBulletinManager();
         prepareClipboardManager();
         prepareScreenCapturer();
+        prepareH264Streamer();
 
         initializeAndRunRfbServer();
 

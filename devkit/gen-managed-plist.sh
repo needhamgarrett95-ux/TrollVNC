@@ -66,6 +66,7 @@ add_bool AutoAssistEnabled     "${TVNC_AUTO_ASSIST_ENABLED:-}"
 add_bool ServerCursor          "${TVNC_SERVER_CURSOR:-}"
 add_bool BonjourEnabled        "${TVNC_BONJOUR_ENABLED:-}"
 add_bool KeyLogging            "${TVNC_KEY_LOGGING:-}"
+add_bool H264Enabled           "${TVNC_H264_ENABLED:-true}"
 
 # Strings (optional)
 add_str DesktopName            "${TVNC_DESKTOP_NAME:-}"
@@ -74,6 +75,7 @@ add_str WheelTuning            "${TVNC_WHEEL_TUNING:-}"
 add_str HttpDir                "${TVNC_HTTP_DIR:-}"
 add_str SslCertFile            "${TVNC_SSL_CERT_FILE:-}"
 add_str SslKeyFile             "${TVNC_SSL_KEY_FILE:-}"
+add_str H264Spec               "${TVNC_H264_SPEC:-0.25@500}"
 # Reverse
 add_str ReverseMode            "${TVNC_REVERSE_MODE:-}"
 add_str ReverseSocket          "${TVNC_REVERSE_SOCKET:-}"
@@ -86,6 +88,7 @@ add_str ModifierMap            "${TVNC_MODIFIER_MAP:-}"
 # Integers (optional)
 add_int Port                           "${TVNC_PORT:-}"
 add_int HttpPort                       "${TVNC_HTTP_PORT:-}"
+add_int H264Port                       "${TVNC_H264_PORT:-5902}"
 add_int ReverseRepeaterID              "${TVNC_REVERSE_REPEATER_ID:-}"
 
 # Reals (optional)
