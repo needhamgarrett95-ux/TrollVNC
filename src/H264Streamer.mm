@@ -60,6 +60,7 @@
 
 #import <arpa/inet.h>
 #import <atomic>
+#import <dlfcn.h>
 #import <errno.h>
 #import <netinet/in.h>
 #import <netinet/tcp.h>
@@ -80,22 +81,35 @@ static const uint8_t kH264AnnexBStartCode[4] = {0x00, 0x00, 0x00, 0x01};
 // streamer queue" so they never dispatch_sync onto themselves (deadlock).
 static const void *kH264QueueSpecificKey = &kH264QueueSpecificKey;
 
-static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sourceFrameRefCon, OSStatus status,
-                                          VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
-    (void)sourceFrameRefCon;
-    (void)infoFlags;
-    H264Streamer *self = (__bridge H264Streamer *)outputCallbackRefCon;
-    if (!self)
-        return;
-    // The sample buffer is only valid for the duration of this callback,
-    // so retain it before hopping to the serial queue.
-    if (sampleBuffer)
-        CFRetain(sampleBuffer);
-    dispatch_async([self queue], ^{
-        [self handleEncodedSampleBuffer:sampleBuffer encodeStatus:status];
-        if (sampleBuffer)
-            CFRelease(sampleBuffer);
+// Two VideoToolbox keys this file uses were introduced in iOS 17.4 and do
+// not exist in the Theos build SDK (iOS 16.5), so the symbols are
+// undeclared at compile time even though the device (18.7.10) supports
+// them — the standalone smoke test used both with the iOS 26.5 SDK and
+// hardware encode worked. Resolve them at runtime the way FFmpeg's
+// videotoolboxenc.c does: dlsym the real framework symbol, falling back
+// to a CFSTR with the key's string value (the value is the short name;
+// FFmpeg's fallback for the RequireHardware key is exactly
+// CFSTR("RequireHardwareAcceleratedVideoEncoder")).
+static CFStringRef H264RequireHardwareAcceleratedVideoEncoderKey(void) {
+    static CFStringRef key = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        CFStringRef *handle =
+            (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder");
+        key = handle ? *handle : CFSTR("RequireHardwareAcceleratedVideoEncoder");
     });
+    return key;
+}
+
+static CFStringRef H264UsingHardwareAcceleratedVideoEncoderKey(void) {
+    static CFStringRef key = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        CFStringRef *handle =
+            (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder");
+        key = handle ? *handle : CFSTR("UsingHardwareAcceleratedVideoEncoder");
+    });
+    return key;
 }
 
 @interface H264Streamer ()
@@ -127,7 +141,28 @@ static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sour
 
 @end
 
+static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sourceFrameRefCon, OSStatus status,
+                                          VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer) {
+    (void)sourceFrameRefCon;
+    (void)infoFlags;
+    H264Streamer *self = (__bridge H264Streamer *)outputCallbackRefCon;
+    if (!self)
+        return;
+    // The sample buffer is only valid for the duration of this callback,
+    // so retain it before hopping to the serial queue.
+    if (sampleBuffer)
+        CFRetain(sampleBuffer);
+    dispatch_async([self queue], ^{
+        [self handleEncodedSampleBuffer:sampleBuffer encodeStatus:status];
+        if (sampleBuffer)
+            CFRelease(sampleBuffer);
+    });
+}
+
 @implementation H264Streamer {
+    // Declared explicitly: the custom -queue getter below suppresses
+    // auto-synthesis of the _queue ivar for the readonly property.
+    dispatch_queue_t _queue;
     NSLock *_sessionLock;              // guards _session, _encWidth/_encHeight, _sessionFailed state
     VTCompressionSessionRef _session;  // NULL until lazily created on first frame with a client
     int _encWidth;                     // encoder session dimensions (0 = not created)
@@ -616,7 +651,7 @@ static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sour
     // available in this daemon context — that failure is the signal.
     NSDictionary *encoderSpec = @{
         (id)kVTVideoEncoderSpecification_EnableLowLatencyRateControl : @YES,
-        (id)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder : @YES,
+        (id)H264RequireHardwareAcceleratedVideoEncoderKey() : @YES,
     };
     NSDictionary *sourceAttrs = @{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)};
 
@@ -663,7 +698,7 @@ static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sour
     // here means "unreported", not "software". The authoritative
     // signal is that Create succeeded with RequireHardware set.
     CFBooleanRef usingHW = NULL;
-    if (VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+    if (VTSessionCopyProperty(session, H264UsingHardwareAcceleratedVideoEncoderKey(),
                               kCFAllocatorDefault, &usingHW) == noErr &&
         usingHW) {
         BOOL hw = CFBooleanGetValue(usingHW);
