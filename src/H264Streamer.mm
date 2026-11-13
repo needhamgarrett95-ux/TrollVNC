@@ -651,7 +651,7 @@ static void H264CompressionOutputCallback(void *outputCallbackRefCon, void *sour
     // available in this daemon context — that failure is the signal.
     NSDictionary *encoderSpec = @{
         (id)kVTVideoEncoderSpecification_EnableLowLatencyRateControl : @YES,
-        (id)H264RequireHardwareAcceleratedVideoEncoderKey() : @YES,
+        (__bridge id)H264RequireHardwareAcceleratedVideoEncoderKey() : @YES,
     };
     NSDictionary *sourceAttrs = @{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)};
 
